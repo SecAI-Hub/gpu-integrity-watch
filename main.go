@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -19,14 +22,14 @@ import (
 
 // IntegrityProfile is the top-level configuration loaded from YAML.
 type IntegrityProfile struct {
-	Version      int                    `yaml:"version"`
-	ModelDir     string                 `yaml:"model_dir"`
-	InferenceURL string                `yaml:"inference_url"`
-	Probes       []ProbeConfig          `yaml:"probes"`
-	Scoring      ScoringConfig          `yaml:"scoring"`
-	Actions      []ActionConfig         `yaml:"actions"`
-	Daemon       DaemonConfig           `yaml:"daemon"`
-	BaselineFile string                 `yaml:"baseline_file"`
+	Version      int            `yaml:"version"`
+	ModelDir     string         `yaml:"model_dir"`
+	InferenceURL string         `yaml:"inference_url"`
+	Probes       []ProbeConfig  `yaml:"probes"`
+	Scoring      ScoringConfig  `yaml:"scoring"`
+	Actions      []ActionConfig `yaml:"actions"`
+	Daemon       DaemonConfig   `yaml:"daemon"`
+	BaselineFile string         `yaml:"baseline_file"`
 }
 
 // ProbeConfig defines a single probe's configuration.
@@ -87,12 +90,12 @@ func auditLog(event string, data map[string]interface{}) {
 // ---------- metrics ----------
 
 var (
-	metricChecks     atomic.Int64
-	metricPass       atomic.Int64
-	metricDrift      atomic.Int64
-	metricFail       atomic.Int64
-	metricActions    atomic.Int64
-	metricHTTPReqs   atomic.Int64
+	metricChecks   atomic.Int64
+	metricPass     atomic.Int64
+	metricDrift    atomic.Int64
+	metricFail     atomic.Int64
+	metricActions  atomic.Int64
+	metricHTTPReqs atomic.Int64
 )
 
 // ---------- main ----------
@@ -329,7 +332,7 @@ func cmdStatus() {
 		}
 	}
 
-	resp, err := http.Get(addr + "/v1/status")
+	resp, err := outboundHTTPClient.Get(addr + "/v1/status")
 	if err != nil {
 		log.Fatalf("cannot reach daemon: %v", err)
 	}
@@ -551,7 +554,33 @@ func cmdDaemon() {
 	}
 
 	log.Printf("gpu-integrity-watch daemon listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down gpu-integrity-watch...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
+	log.Println("gpu-integrity-watch stopped")
 }
 
 // ---------- helpers ----------
