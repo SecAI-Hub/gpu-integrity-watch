@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---------- probe tests ----------
@@ -159,7 +162,7 @@ func TestReferenceDrift_Skip(t *testing.T) {
 	}
 }
 
-func TestECCStatus_Skip(t *testing.T) {
+func TestECCStatus_UnknownWithoutTrustedTool(t *testing.T) {
 	profile := &IntegrityProfile{}
 	runner := NewProbeRunner(profile, nil)
 
@@ -170,8 +173,8 @@ func TestECCStatus_Skip(t *testing.T) {
 		Settings: map[string]string{"nvidia_smi_path": "/nonexistent/nvidia-smi"},
 	})
 
-	if result.Status != StatusSkip {
-		t.Errorf("expected skip without nvidia-smi, got %s", result.Status)
+	if result.Status != StatusUnknown {
+		t.Errorf("expected unknown without trusted nvidia-smi, got %s", result.Status)
 	}
 }
 
@@ -208,8 +211,58 @@ func TestParseECC_Disabled(t *testing.T) {
 
 func TestParseECC_NotSupported(t *testing.T) {
 	result := parseECCOutput(ProbeResult{}, "[Not Supported]")
-	if result.Status != StatusSkip {
-		t.Errorf("expected skip for unsupported ECC, got %s", result.Status)
+	if result.Status != StatusUnknown {
+		t.Errorf("expected unknown for unsupported ECC, got %s", result.Status)
+	}
+}
+
+func TestParseECC_MalformedAndNAAreUnknown(t *testing.T) {
+	for _, output := range []string{"N/A, 0, Enabled", "0, nope, Enabled", "0, 0, Mystery", "0,0", "18446744073709551616,0,Enabled"} {
+		if result := parseECCOutput(ProbeResult{}, output); result.Status != StatusUnknown {
+			t.Errorf("expected unknown for %q, got %s", output, result.Status)
+		}
+	}
+}
+
+func TestParseECC_AggregatesWorstAcrossAllGPUs(t *testing.T) {
+	result := parseECCOutput(ProbeResult{}, "0, 0, Enabled\n150, 0, Enabled\n0, 2, Enabled")
+	if result.Status != StatusFail || len(result.Findings) != 3 {
+		t.Fatalf("expected all GPUs to be accounted with fail as worst: %#v", result)
+	}
+}
+
+func TestParseECC_AccountsForMalformedWidthBeforeLaterFailure(t *testing.T) {
+	result := parseECCOutput(ProbeResult{}, "0,0\n0,2,Enabled")
+	if result.Status != StatusFail || len(result.Findings) != 2 {
+		t.Fatalf("expected malformed and failing GPUs to be accounted: %#v", result)
+	}
+}
+
+func TestProbeCycleDeadlineFailsClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runner := NewProbeRunner(&IntegrityProfile{InferenceURL: "http://127.0.0.1:1"}, &Baseline{
+		SentinelRefs: []SentinelRef{{Name: "deadline", Input: "x", Expected: "y"}},
+	})
+	result := runner.runSentinelInferenceContext(ctx, ProbeConfig{Name: "sentinel", Type: ProbeSentinelInfer, Enabled: true})
+	if result.Status != StatusError || result.Score != 1 {
+		t.Fatalf("expired cycle must fail closed: %#v", result)
+	}
+}
+
+func TestValidateTrustedExecutable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nvidia-smi")
+	if err := os.WriteFile(path, []byte("fixture"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateTrustedExecutable(path); err != nil {
+		t.Fatalf("trusted executable rejected: %v", err)
+	}
+	if err := os.Chmod(path, 0775); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateTrustedExecutable(path); err == nil {
+		t.Fatal("group-writable executable must be rejected")
 	}
 }
 
@@ -287,7 +340,7 @@ func TestScoring_DriftWarning(t *testing.T) {
 	}
 }
 
-func TestScoring_SkippedIgnored(t *testing.T) {
+func TestScoring_SkippedProducesUnknown(t *testing.T) {
 	scorer := NewScoringEngine(nil, 10)
 	results := []ProbeResult{
 		{Probe: "a", Type: ProbeTensorHash, Status: StatusSkip, Score: 0.0},
@@ -295,8 +348,8 @@ func TestScoring_SkippedIgnored(t *testing.T) {
 	}
 
 	entry := scorer.Score(results)
-	if entry.Verdict != VerdictHealthy {
-		t.Errorf("skipped probes should not affect verdict, got %s", entry.Verdict)
+	if entry.Verdict != VerdictUnknown {
+		t.Errorf("missing evidence should produce unknown, got %s", entry.Verdict)
 	}
 	if _, ok := entry.ProbeScores["a"]; ok {
 		t.Error("skipped probe should not appear in scores")
@@ -315,6 +368,27 @@ func TestScoring_History(t *testing.T) {
 	hist := scorer.History()
 	if len(hist) != 5 {
 		t.Errorf("expected max 5 history entries, got %d", len(hist))
+	}
+}
+
+func TestScoring_UpdateConfigAndDefensiveCopies(t *testing.T) {
+	scorer := NewScoringEngine(map[ProbeType]float64{ProbeTensorHash: 1, ProbeECCStatus: 1}, 5)
+	scorer.Score([]ProbeResult{
+		{Probe: "hash", Type: ProbeTensorHash, Status: StatusDrift, Score: 1},
+		{Probe: "ecc", Type: ProbeECCStatus, Status: StatusPass, Score: 0},
+	})
+	scorer.UpdateConfig(map[ProbeType]float64{ProbeTensorHash: 9, ProbeECCStatus: 1}, 1)
+	entry := scorer.Score([]ProbeResult{
+		{Probe: "hash", Type: ProbeTensorHash, Status: StatusDrift, Score: 1},
+		{Probe: "ecc", Type: ProbeECCStatus, Status: StatusPass, Score: 0},
+	})
+	if entry.CompositeScore < 0.89 || len(scorer.History()) != 1 {
+		t.Fatalf("reloaded scoring config was not applied: %#v", entry)
+	}
+	latest := scorer.Latest()
+	latest.ProbeScores["hash"] = 0
+	if scorer.Latest().ProbeScores["hash"] == 0 {
+		t.Fatal("latest score must be a defensive copy")
 	}
 }
 
@@ -397,6 +471,7 @@ func TestActionExecutor_AlertTriggered(t *testing.T) {
 }
 
 func TestActionExecutor_QuarantineMovesFiles(t *testing.T) {
+	t.Setenv("GPU_WATCH_ALLOW_QUARANTINE", "true")
 	modelDir := t.TempDir()
 	qDir := t.TempDir()
 	writeFile(t, modelDir, "model.gguf", "model-data")
@@ -420,6 +495,25 @@ func TestActionExecutor_QuarantineMovesFiles(t *testing.T) {
 	// readme.txt should remain (not a model file)
 	if _, err := os.Stat(filepath.Join(modelDir, "readme.txt")); err != nil {
 		t.Error("readme.txt should remain in model dir")
+	}
+}
+
+func TestActionExecutor_QuarantineNestedFiles(t *testing.T) {
+	t.Setenv("GPU_WATCH_ALLOW_QUARANTINE", "true")
+	modelDir := t.TempDir()
+	qDir := t.TempDir()
+	nested := filepath.Join(modelDir, "versions", "v1")
+	if err := os.MkdirAll(nested, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, nested, "model.gguf", "model-data")
+	executor := NewActionExecutor([]ActionConfig{{Name: "quarantine", Type: ActionQuarantine, Trigger: VerdictCritical, TargetDir: qDir}}, modelDir, "")
+	results := executor.Evaluate(ScoreEntry{Verdict: VerdictCritical})
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("nested quarantine failed: %#v", results)
+	}
+	if _, err := os.Stat(filepath.Join(qDir, "versions", "v1", "model.gguf")); err != nil {
+		t.Fatal("nested model was not quarantined")
 	}
 }
 
@@ -466,8 +560,8 @@ func TestRunAll_Integration(t *testing.T) {
 		if r.Probe == "hash-check" && r.Status != StatusPass {
 			t.Errorf("hash-check expected pass, got %s", r.Status)
 		}
-		if r.Probe == "ecc-check" && r.Status != StatusSkip {
-			t.Errorf("ecc-check expected skip, got %s", r.Status)
+		if r.Probe == "ecc-check" && r.Status != StatusUnknown {
+			t.Errorf("ecc-check expected unknown, got %s", r.Status)
 		}
 	}
 }
@@ -536,7 +630,7 @@ func TestHTTP_Health(t *testing.T) {
 
 func TestHTTP_Check(t *testing.T) {
 	mux := buildTestMux(t)
-	req := httptest.NewRequest("POST", "/v1/check", nil)
+	req := authorizedGPURequest("POST", "/v1/check")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -556,7 +650,7 @@ func TestHTTP_Check(t *testing.T) {
 
 func TestHTTP_CheckMethodNotAllowed(t *testing.T) {
 	mux := buildTestMux(t)
-	req := httptest.NewRequest("GET", "/v1/check", nil)
+	req := authorizedGPURequest("GET", "/v1/check")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -567,7 +661,7 @@ func TestHTTP_CheckMethodNotAllowed(t *testing.T) {
 
 func TestHTTP_Status(t *testing.T) {
 	mux := buildTestMux(t)
-	req := httptest.NewRequest("GET", "/v1/status", nil)
+	req := authorizedGPURequest("GET", "/v1/status")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -578,7 +672,7 @@ func TestHTTP_Status(t *testing.T) {
 
 func TestHTTP_History(t *testing.T) {
 	mux := buildTestMux(t)
-	req := httptest.NewRequest("GET", "/v1/history", nil)
+	req := authorizedGPURequest("GET", "/v1/history")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -589,7 +683,7 @@ func TestHTTP_History(t *testing.T) {
 
 func TestHTTP_Metrics(t *testing.T) {
 	mux := buildTestMux(t)
-	req := httptest.NewRequest("GET", "/v1/metrics", nil)
+	req := authorizedGPURequest("GET", "/v1/metrics")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -649,8 +743,8 @@ func TestHTTP_BaselineRequiresToken(t *testing.T) {
 
 func TestCheckToken_Empty(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
-	if !checkToken(req, "") {
-		t.Error("empty expected token should allow all requests")
+	if checkToken(req, "") {
+		t.Error("empty expected token must fail closed")
 	}
 }
 
@@ -670,6 +764,23 @@ func TestCheckToken_Invalid(t *testing.T) {
 	}
 }
 
+func TestReadCredentialRequiresOwnerOnlyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credential")
+	credential := strings.Repeat("x", 32)
+	if err := os.WriteFile(path, []byte(credential), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCredentialFile(path); err == nil {
+		t.Fatal("group/world-readable credential must be rejected")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := readCredentialFile(path); err != nil || value != credential {
+		t.Fatalf("owner-only credential rejected: value=%q err=%v", value, err)
+	}
+}
+
 // ---------- helpers ----------
 
 func writeFile(t *testing.T, dir, name, content string) {
@@ -685,12 +796,18 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-func buildTestMux(t *testing.T) *http.ServeMux {
-	t.Helper()
-	return buildTestMuxWithToken(t, "")
+func authorizedGPURequest(method, target string) *http.Request {
+	req := httptest.NewRequest(method, target, nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	return req
 }
 
-func buildTestMuxWithToken(t *testing.T, token string) *http.ServeMux {
+func buildTestMux(t *testing.T) http.Handler {
+	t.Helper()
+	return buildTestMuxWithToken(t, "test-token")
+}
+
+func buildTestMuxWithToken(t *testing.T, token string) http.Handler {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -788,5 +905,240 @@ daemon:
 		json.NewEncoder(w).Encode(map[string]string{"status": "baseline captured"})
 	})
 
-	return mux
+	return authenticatedGPUHandler(mux, token)
+}
+
+func TestTensorHashRejectsSymlinkEvidence(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.gguf")
+	if err := os.WriteFile(realPath, []byte("model"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, filepath.Join(dir, "linked.gguf")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	runner := NewProbeRunner(&IntegrityProfile{ModelDir: dir}, &Baseline{TensorHashes: map[string]string{"real.gguf": sha256Hex("model")}})
+	result := runner.runTensorHash(ProbeConfig{Name: "hash", Type: ProbeTensorHash, Enabled: true})
+	if result.Status != StatusError {
+		t.Fatalf("unsafe model evidence must produce error, got %s", result.Status)
+	}
+}
+
+func TestDriverFingerprintBaseline(t *testing.T) {
+	dir := t.TempDir()
+	versionPath := filepath.Join(dir, "version")
+	if err := os.WriteFile(versionPath, []byte("550.90.07\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	baseline := &Baseline{DriverFingerprint: &DriverBaseline{DriverVersion: "550.90.07", KernelModule: "nvidia"}}
+	runner := NewProbeRunner(&IntegrityProfile{}, baseline)
+	probe := ProbeConfig{Name: "driver", Type: ProbeDriverFingerprint, Enabled: true, Settings: map[string]string{
+		"driver_version_path": versionPath,
+		"kernel_module":       "nvidia",
+	}}
+	if result := runner.runDriverFingerprint(probe); result.Status != StatusPass {
+		t.Fatalf("expected matching driver baseline, got %s: %#v", result.Status, result.Findings)
+	}
+	baseline.DriverFingerprint.DriverVersion = "old-version"
+	if result := runner.runDriverFingerprint(probe); result.Status != StatusFail {
+		t.Fatalf("expected driver mismatch failure, got %s", result.Status)
+	}
+}
+
+func TestDeviceAllowlistMissingBaselineFailsClosed(t *testing.T) {
+	runner := NewProbeRunner(&IntegrityProfile{}, nil)
+	result := runner.runDeviceAllowlist(ProbeConfig{Name: "devices", Type: ProbeDeviceAllowlist, Enabled: true, Settings: map[string]string{"device_dir": t.TempDir()}})
+	if result.Status != StatusError {
+		t.Fatalf("missing device baseline must error, got %s", result.Status)
+	}
+}
+
+func TestUnknownVerdictNeverTriggersDestructiveAction(t *testing.T) {
+	t.Setenv("GPU_WATCH_ALLOW_SHUTDOWN", "true")
+	executor := NewActionExecutor([]ActionConfig{{Name: "contain", Type: ActionFailClosed, Trigger: VerdictCritical}}, "", "")
+	results := executor.Evaluate(ScoreEntry{Verdict: VerdictUnknown})
+	if len(results) != 0 {
+		t.Fatal("unknown evidence must never trigger destructive containment")
+	}
+}
+
+func TestUnknownVerdictOnlyAllowsAlerts(t *testing.T) {
+	executor := NewActionExecutor([]ActionConfig{
+		{Name: "reload", Type: ActionReload, Trigger: VerdictWarning},
+		{Name: "alert", Type: ActionAlert, Trigger: VerdictWarning},
+	}, "", "")
+	results := executor.Evaluate(ScoreEntry{Verdict: VerdictUnknown})
+	if len(results) != 1 || results[0].Type != ActionAlert {
+		t.Fatalf("unknown evidence must only notify: %#v", results)
+	}
+}
+
+func TestDestructiveActionsRequireSeparateOptIns(t *testing.T) {
+	executor := NewActionExecutor([]ActionConfig{
+		{Name: "quarantine", Type: ActionQuarantine, Trigger: VerdictCritical},
+		{Name: "shutdown", Type: ActionFailClosed, Trigger: VerdictCritical},
+	}, t.TempDir(), "")
+	results := executor.Evaluate(ScoreEntry{Verdict: VerdictCritical})
+	if len(results) != 2 || results[0].Triggered || results[1].Triggered {
+		t.Fatalf("destructive actions must be inert by default: %#v", results)
+	}
+}
+
+func TestDestructiveActionCooldownIsIdempotent(t *testing.T) {
+	t.Setenv("GPU_WATCH_ALLOW_QUARANTINE", "true")
+	modelDir := t.TempDir()
+	quarantineDir := t.TempDir()
+	writeFile(t, modelDir, "model.gguf", "model")
+	executor := NewActionExecutor([]ActionConfig{{
+		Name: "quarantine", Type: ActionQuarantine, Trigger: VerdictCritical,
+		TargetDir: quarantineDir, Cooldown: "1h",
+	}}, modelDir, "")
+	first := executor.Evaluate(ScoreEntry{Verdict: VerdictCritical})
+	second := executor.Evaluate(ScoreEntry{Verdict: VerdictCritical})
+	if len(first) != 1 || !first[0].Success || len(second) != 1 || second[0].Triggered {
+		t.Fatalf("destructive action was not idempotently suppressed: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestCommandActionDoesNotInvokeShell(t *testing.T) {
+	t.Setenv("GPU_WATCH_ALLOW_ACTION_COMMANDS", "true")
+	marker := filepath.Join(t.TempDir(), "should-not-exist")
+	result := executeCommand(ActionConfig{Name: "safe", Type: ActionAlert, Command: "/bin/echo safe ; /usr/bin/touch " + marker})
+	if !result.Success {
+		t.Fatalf("direct command should execute: %s", result.Message)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("command arguments were interpreted by a shell")
+	}
+}
+
+func TestServiceURLRequiresTLSOffLoopback(t *testing.T) {
+	if _, err := parseServiceURL("http://example.com"); err == nil {
+		t.Fatal("remote plaintext service URL must be rejected")
+	}
+	if _, err := parseServiceURL("http://127.0.0.1:8505"); err != nil {
+		t.Fatalf("loopback service URL rejected: %v", err)
+	}
+	if _, err := parseServiceURL("https://example.com"); err != nil {
+		t.Fatalf("TLS service URL rejected: %v", err)
+	}
+}
+
+func TestIncidentReporterAuthenticatesAndDeduplicates(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer recorder-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		calls.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+	reporter := newIncidentReporter()
+	entry := ScoreEntry{Timestamp: time.Now(), Verdict: VerdictCritical, CompositeScore: 1, ProbeStatuses: map[string]ProbeStatus{"hash": StatusFail}}
+	results := []ProbeResult{{Probe: "hash", Type: ProbeTensorHash, Status: StatusFail}}
+	if err := reporter.Report(server.URL, "recorder-secret", entry, results); err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Report(server.URL, "recorder-secret", entry, results); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected one deduplicated report, got %d", calls.Load())
+	}
+}
+
+func TestAuthenticatedGPUHandlerProtectsReadEndpoints(t *testing.T) {
+	handler := authenticatedGPUHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}), "secret")
+	request := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected authenticated read endpoint, got %d", response.Code)
+	}
+}
+
+func TestVerifyGPUAuditRejectsUnknownAndTrailingJSON(t *testing.T) {
+	dir := t.TempDir()
+	entry := GPUAuditEntry{Timestamp: time.Now().UTC().Format(time.RFC3339Nano), Event: "test"}
+	entry.Hash = computeGPUAuditHash(entry)
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, line := range map[string][]byte{
+		"unknown":  append(append([]byte{}, data[:len(data)-1]...), []byte(`,"unexpected":true}`)...),
+		"trailing": append(append([]byte{}, data...), []byte(` {}`)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".jsonl")
+			if err := os.WriteFile(path, append(line, '\n'), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := verifyGPUAudit(path); err == nil {
+				t.Fatal("non-strict audit JSON must be rejected")
+			}
+		})
+	}
+}
+
+func TestGPUAuditWriteFailurePoisonsSensitiveEndpoints(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditFile = f
+	auditRequired.Store(true)
+	auditHealthy.Store(true)
+	auditLastHash = ""
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		auditFile = nil
+		auditRequired.Store(false)
+		auditHealthy.Store(false)
+		auditLastHash = ""
+	})
+	if err := auditLog(GPUAuditEntry{Event: "test"}); err == nil {
+		t.Fatal("closed audit file must fail")
+	}
+	handler := authenticatedGPUHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unhealthy audit must block protected endpoints")
+	}), strings.Repeat("t", 32))
+	req := httptest.NewRequest(http.MethodPost, "/v1/check", nil)
+	req.Header.Set("Authorization", "Bearer "+strings.Repeat("t", 32))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestProfileAndBaselineRejectGroupWritableFiles(t *testing.T) {
+	dir := t.TempDir()
+	profilePath := filepath.Join(dir, "profile.yaml")
+	if err := os.WriteFile(profilePath, []byte("version: 1\n"), 0620); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(profilePath, 0620); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadProfileFile(profilePath); err == nil {
+		t.Fatal("group-writable profile must be rejected")
+	}
+	baselinePath := filepath.Join(dir, "baseline.yaml")
+	if err := os.WriteFile(baselinePath, []byte("captured_at: 2026-08-02T00:00:00Z\n"), 0620); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(baselinePath, 0620); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadBaselineFile(&IntegrityProfile{BaselineFile: baselinePath}); err == nil {
+		t.Fatal("group-writable baseline must be rejected")
+	}
 }

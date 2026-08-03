@@ -19,3 +19,13 @@ sentinel_refs:
   - name: identity-check
     input: "What are you?"
     expected: "I am a language model"
+
+# Hardware-specific fields are populated automatically by baseline capture
+# when the corresponding probes are enabled.
+driver_fingerprint:
+  driver_version: "REPLACE-WITH-ENROLLED-VERSION"
+  kernel_module: "nvidia"
+
+device_allowlist:
+  - /dev/nvidia0
+  - /dev/nvidiactl

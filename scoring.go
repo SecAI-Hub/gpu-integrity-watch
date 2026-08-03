@@ -33,10 +33,10 @@ type ScoreEntry struct {
 
 // ScoringEngine computes composite anomaly scores and tracks history.
 type ScoringEngine struct {
-	mu       sync.Mutex
-	history  []ScoreEntry
-	maxHist  int
-	weights  map[ProbeType]float64
+	mu      sync.Mutex
+	history []ScoreEntry
+	maxHist int
+	weights map[ProbeType]float64
 }
 
 // NewScoringEngine creates a scoring engine with configured weights and history size.
@@ -46,16 +46,43 @@ func NewScoringEngine(weights map[ProbeType]float64, maxHistory int) *ScoringEng
 	}
 	if weights == nil {
 		weights = map[ProbeType]float64{
-			ProbeTensorHash:     1.0,
-			ProbeSentinelInfer:  1.0,
-			ProbeReferenceDrift: 0.8,
-			ProbeECCStatus:      0.6,
+			ProbeTensorHash:        1.0,
+			ProbeSentinelInfer:     1.0,
+			ProbeReferenceDrift:    0.8,
+			ProbeECCStatus:         0.6,
+			ProbeDriverFingerprint: 1.0,
+			ProbeDeviceAllowlist:   1.0,
 		}
 	}
 	return &ScoringEngine{
-		weights: weights,
+		weights: cloneWeights(weights),
 		maxHist: maxHistory,
 	}
+}
+
+func cloneWeights(weights map[ProbeType]float64) map[ProbeType]float64 {
+	result := make(map[ProbeType]float64, len(weights))
+	for key, value := range weights {
+		result[key] = value
+	}
+	return result
+}
+
+// UpdateConfig applies reloadable scoring settings without discarding history.
+func (s *ScoringEngine) UpdateConfig(weights map[ProbeType]float64, maxHistory int) {
+	if maxHistory <= 0 {
+		maxHistory = 100
+	}
+	if weights == nil {
+		weights = NewScoringEngine(nil, maxHistory).weights
+	}
+	s.mu.Lock()
+	s.weights = cloneWeights(weights)
+	s.maxHist = maxHistory
+	if len(s.history) > s.maxHist {
+		s.history = s.history[len(s.history)-s.maxHist:]
+	}
+	s.mu.Unlock()
 }
 
 // Score computes the composite anomaly score from probe results and records it.
@@ -71,6 +98,7 @@ func (s *ScoringEngine) Score(results []ProbeResult) ScoreEntry {
 
 	for _, r := range results {
 		if r.Status == StatusSkip {
+			entry.ProbeStatuses[r.Probe] = r.Status
 			continue
 		}
 		entry.ProbeScores[r.Probe] = r.Score
@@ -102,10 +130,20 @@ func (s *ScoringEngine) Score(results []ProbeResult) ScoreEntry {
 
 // classifyVerdict determines the verdict from score and probe statuses.
 func classifyVerdict(composite float64, results []ProbeResult) Verdict {
-	// Any fail probe -> critical regardless of score
+	if len(results) == 0 {
+		return VerdictUnknown
+	}
+	// Missing or erroneous evidence cannot establish a healthy GPU state.
+	hasDrift := false
 	for _, r := range results {
 		if r.Status == StatusFail {
 			return VerdictCritical
+		}
+		if r.Status == StatusError || r.Status == StatusSkip || r.Status == StatusUnknown {
+			return VerdictUnknown
+		}
+		if r.Status == StatusDrift {
+			hasDrift = true
 		}
 	}
 
@@ -113,6 +151,8 @@ func classifyVerdict(composite float64, results []ProbeResult) Verdict {
 	case composite >= ThresholdCritical:
 		return VerdictCritical
 	case composite >= ThresholdNormal:
+		return VerdictWarning
+	case hasDrift:
 		return VerdictWarning
 	default:
 		return VerdictHealthy
@@ -125,7 +165,9 @@ func (s *ScoringEngine) History() []ScoreEntry {
 	defer s.mu.Unlock()
 
 	out := make([]ScoreEntry, len(s.history))
-	copy(out, s.history)
+	for i := range s.history {
+		out[i] = cloneScoreEntry(s.history[i])
+	}
 	return out
 }
 
@@ -137,8 +179,21 @@ func (s *ScoringEngine) Latest() *ScoreEntry {
 	if len(s.history) == 0 {
 		return nil
 	}
-	e := s.history[len(s.history)-1]
+	e := cloneScoreEntry(s.history[len(s.history)-1])
 	return &e
+}
+
+func cloneScoreEntry(entry ScoreEntry) ScoreEntry {
+	result := entry
+	result.ProbeScores = make(map[string]float64, len(entry.ProbeScores))
+	for key, value := range entry.ProbeScores {
+		result.ProbeScores[key] = value
+	}
+	result.ProbeStatuses = make(map[string]ProbeStatus, len(entry.ProbeStatuses))
+	for key, value := range entry.ProbeStatuses {
+		result.ProbeStatuses[key] = value
+	}
+	return result
 }
 
 // Trend computes the score trend over the last N entries.

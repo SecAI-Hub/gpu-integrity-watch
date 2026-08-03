@@ -33,6 +33,14 @@ probes:
     type: ecc_status
     enabled: true
 
+  - name: driver-fingerprint
+    type: driver_fingerprint
+    enabled: true
+
+  - name: device-allowlist
+    type: device_allowlist
+    enabled: true
+
 # Scoring weights (higher = more impact on composite score).
 scoring:
   weights:
@@ -40,6 +48,8 @@ scoring:
     sentinel_inference: 1.0
     reference_drift: 0.8
     ecc_status: 0.6
+    driver_fingerprint: 1.0
+    device_allowlist: 1.0
   max_history: 200
 
 # Automated response actions.
@@ -56,12 +66,19 @@ actions:
     type: quarantine
     trigger: critical
     target_dir: /var/lib/secure-ai/quarantine
+    cooldown: 15m
 
   - name: fail-closed
     type: fail_closed
     trigger: critical
+    cooldown: 15m
 
 # Daemon settings.
 daemon:
   bind_addr: "127.0.0.1:8505"
   interval: "5m"
+
+# Optional authenticated delivery to ai-incident-recorder.
+integrations:
+  incident_recorder_url: ""
+  incident_recorder_token_path: /run/secure-ai/incident-recorder-token
