@@ -134,6 +134,12 @@ func classifyVerdict(composite float64, results []ProbeResult) Verdict {
 		return VerdictUnknown
 	}
 	// Missing or erroneous evidence cannot establish a healthy GPU state.
+	// A confirmed failure dominates unavailable evidence regardless of order.
+	for _, r := range results {
+		if r.Status == StatusFail {
+			return VerdictCritical
+		}
+	}
 	hasDrift := false
 	for _, r := range results {
 		if r.Status == StatusFail {
